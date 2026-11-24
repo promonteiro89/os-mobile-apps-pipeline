@@ -1,0 +1,308 @@
+# frozen_string_literal: true
+
+default_platform(:android)
+
+# Google Play tracks a build can already sit on, in promotion order.
+PLAY_TRACKS = %w[internal alpha beta production].freeze
+
+def env_bool(name, default = false)
+  val = ENV.fetch(name, default.to_s).to_s.strip.downcase
+  %w[true 1 yes y].include?(val)
+end
+
+def release_file
+  file = ENV.fetch("RELEASE_FILE", nil)
+  UI.user_error!("RELEASE_FILE environment variable is not set") if file.nil? || file.empty?
+  UI.user_error!("Release file not found at #{file}") unless File.exist?(file)
+  file
+end
+
+def release_notes
+  notes = ENV.fetch("RELEASE_NOTES", nil)
+  return nil if notes.nil? || notes.strip.empty?
+  notes.strip
+end
+
+def release_notes_languages
+  ENV.fetch("RELEASE_NOTES_LANGUAGES", "en-US").split(",").map(&:strip).reject(&:empty?)
+end
+
+def asc_api_key
+  key_id = ENV.fetch("ASC_KEY_ID")
+  issuer_id = ENV.fetch("ASC_ISSUER_ID")
+  key_p8 = ENV.fetch("ASC_KEY_P8")
+  # Also sets Spaceship::ConnectAPI.token, used by the direct App Store Connect queries below.
+  app_store_connect_api_key(
+    key_id: key_id,
+    issuer_id: issuer_id,
+    key_content: key_p8,
+    is_key_content_base64: false,
+    in_house: false,
+  )
+end
+
+# --------------------------------------------------------------------------- Google Play helpers
+
+def play_credentials
+  { package_name: ENV.fetch("ANDROID_PACKAGE"), json_key_data: ENV.fetch("GOOGLE_PLAY_JSON_KEY") }
+end
+
+# Options shared by every supply call: never touch the store listing, only the release.
+def play_release_params
+  play_credentials.merge(
+    skip_upload_metadata: true,
+    skip_upload_images: true,
+    skip_upload_screenshots: true,
+    skip_upload_changelogs: true,
+    validate_only: env_bool("DRY_RUN"),
+  )
+end
+
+def play_duplicate_version_code?(error)
+  error.message.include?("already been used") || error.message.include?("apkUpgradeVersionConflict")
+end
+
+# Tracks (internal/alpha/beta/production) whose current releases contain the version code. Read-only.
+def play_tracks_with(version_code)
+  PLAY_TRACKS.select do |name|
+    google_play_track_version_codes(**play_credentials, track: name).include?(version_code)
+  end
+end
+
+# The build is already on Google Play: move it to the requested track instead of re-uploading it.
+def release_existing_play_build(version_code:, track:, status:, rollout:, changelogs:)
+  holding = play_tracks_with(version_code)
+  rollout_param = rollout < 100 ? (rollout / 100.0).to_s : nil
+
+  if holding.include?(track)
+    if status == "draft"
+      UI.user_error!("Version code #{version_code} is already on the '#{track}' track; there is no draft to create. Manage it in Play Console.")
+    end
+    # Same track: adjust the rollout (e.g. 20% -> 50%, or 100% to complete a staged rollout).
+    UI.important("Version code #{version_code} is already on '#{track}'. Setting its rollout to #{rollout}%...")
+    params = play_release_params.merge(
+      track: track,
+      version_code: version_code,
+      release_status: rollout_param ? "inProgress" : "completed",
+      rollout: rollout_param || "1",
+    )
+    params.merge!(changelogs) if changelogs
+    begin
+      upload_to_play_store(params)
+    rescue => e
+      raise unless e.message.include?("Unable to find the requested release")
+      UI.user_error!(
+        "Version code #{version_code} on '#{track}' is already fully released (or halted); the pipeline does not change it. " \
+        "To ship new code, generate a build with a higher version code in LifeTime."
+      )
+    end
+    UI.success("Rollout of version code #{version_code} on '#{track}' set to #{rollout}%.")
+    return
+  end
+
+  source = holding.first
+  unless source
+    UI.user_error!(
+      "Google Play already has version code #{version_code}, but it is not on the internal, alpha, beta or production track " \
+      "(it was superseded, or only exists in App bundle explorer).\n" \
+      "Either add it to '#{track}' in Play Console (Test and release -> the track -> Create release -> 'Add from library'), " \
+      "or generate a build with a higher version code in LifeTime."
+    )
+  end
+
+  UI.important("Version code #{version_code} is already uploaded and is on '#{source}'. Promoting it to '#{track}'...")
+  params = play_release_params.merge(
+    track: source,
+    track_promote_to: track,
+    track_promote_release_status: status,
+    version_code: version_code,
+  )
+  # supply only applies a rollout to a promotion when 0 < rollout < 1.
+  params[:rollout] = rollout_param if rollout_param && status == "completed"
+  params.merge!(changelogs) if changelogs
+  upload_to_play_store(params)
+  UI.success("Promoted version code #{version_code} from '#{source}' to '#{track}'.")
+end
+
+platform :android do
+  # Inputs: RELEASE_FILE (.aab or .apk), ANDROID_PACKAGE, ANDROID_TRACK (internal|alpha|beta|production),
+  #      ANDROID_ROLLOUT (1-100), ANDROID_RELEASE_STATUS (completed|draft), ANDROID_VERSION_CODE
+  desc "Upload an Android App Bundle / APK to Google Play"
+  lane :upload do
+    file = release_file
+    track = ENV.fetch("ANDROID_TRACK", "internal")
+    status = ENV.fetch("ANDROID_RELEASE_STATUS", "completed")
+    rollout = ENV.fetch("ANDROID_ROLLOUT", "100").to_f
+    vcode = ENV.fetch("ANDROID_VERSION_CODE", "").strip
+    vcode = vcode.empty? ? nil : Integer(vcode, 10)
+    metadata = File.expand_path("../build/play-metadata", __dir__)
+
+    UI.user_error!("ANDROID_RELEASE_STATUS must be 'completed' or 'draft' (got '#{status}')") unless %w[completed draft].include?(status)
+    UI.user_error!("ANDROID_ROLLOUT must be greater than 0 and at most 100 (got #{rollout})") unless rollout > 0 && rollout <= 100
+    if track == "internal" && rollout < 100
+      UI.important("Staged rollouts are not available on the internal testing track; releasing to all internal testers.")
+      rollout = 100.0
+    end
+    if status == "draft" && rollout < 100
+      UI.important("A draft release has no rollout; set the percentage when you publish it in Play Console.")
+      rollout = 100.0
+    end
+
+    changelogs = nil
+    if release_notes
+      # supply reads release notes from <metadata>/<locale>/changelogs/default.txt (Google Play limit: 500 chars)
+      UI.important("Release notes are #{release_notes.length} characters; Google Play keeps only the first 500.") if release_notes.length > 500
+      FileUtils.rm_rf(metadata)
+      release_notes_languages.each do |locale|
+        dir = File.join(metadata, locale, "changelogs")
+        FileUtils.mkdir_p(dir)
+        File.write(File.join(dir, "default.txt"), release_notes[0, 500])
+      end
+      changelogs = { metadata_path: metadata, skip_upload_changelogs: false }
+    end
+
+    params = play_release_params.merge(track: track, release_status: status)
+    file.end_with?(".aab") ? params[:aab] = file : params[:apk] = file
+    if status == "completed" && rollout < 100
+      params[:release_status] = "inProgress"
+      params[:rollout] = (rollout / 100.0).to_s
+    end
+    params.merge!(changelogs) if changelogs
+
+    begin
+      upload_to_play_store(params)
+    rescue => e
+      raise unless vcode && play_duplicate_version_code?(e)
+      release_existing_play_build(version_code: vcode, track: track, status: status, rollout: rollout, changelogs: changelogs)
+    end
+  end
+
+  desc "Check the Play service account can access the app (read-only)"
+  lane :check_access do
+    package = ENV.fetch("ANDROID_PACKAGE")
+    codes = google_play_track_version_codes(**play_credentials, track: "production")
+    UI.success("Google Play access OK for #{package}; production version codes: #{codes.join(', ')}")
+  end
+end
+
+# --------------------------------------------------------------------------- App Store Connect helpers
+
+# The upload of this exact version/build already reached App Store Connect (processing or processed).
+# Returns nil when it hasn't, or when the lookup itself fails (the upload then decides).
+# The state is filtered by the API, as fastlane's app_store_build_number does: in responses it is an
+# object ({state, errors, ...}), not a string.
+def existing_asc_upload(app, version, build_num)
+  Spaceship::ConnectAPI.get_build_uploads(
+    app_id: app.id,
+    filter: { cfBundleShortVersionString: version, cfBundleVersion: build_num, state: "PROCESSING,COMPLETE" },
+    limit: 1,
+  ).first
+rescue => e
+  UI.important("Could not check App Store Connect for an earlier upload of #{version} (#{build_num}): #{e.message}. Uploading.")
+  nil
+end
+
+# "What's New" for App Store review, in exactly the languages the version already has. Listing a language
+# the version lacks would make deliver add an empty localization, and the submission would then fail.
+def asc_whats_new(app, notes)
+  return nil unless notes
+  locales = []
+  begin
+    platform = Spaceship::ConnectAPI::Platform::IOS
+    version = app.get_edit_app_store_version(platform: platform) || app.get_live_app_store_version(platform: platform)
+    locales = version.get_app_store_version_localizations.map(&:locale) if version
+  rescue => e
+    UI.important("Could not read the App Store version's languages (#{e.message}); using the app's primary language.")
+  end
+  locales = [app.primary_locale] if locales.empty?
+  locales.compact.uniq.to_h { |locale| [locale, notes] }
+end
+
+# Export compliance answer for builds that don't declare ITSAppUsesNonExemptEncryption in Info.plist.
+def ios_uses_non_exempt_encryption
+  env_bool("IOS_USES_NON_EXEMPT_ENCRYPTION")
+end
+
+platform :ios do
+  # Inputs: RELEASE_FILE (.ipa), IOS_BUNDLE_ID, IOS_VERSION, IOS_BUILD,
+  #      IOS_TARGET (testflight|app-store-review)
+  desc "Upload an iOS IPA to TestFlight or App Store Connect review"
+  lane :upload do
+    file = release_file
+    target = ENV.fetch("IOS_TARGET", "testflight")
+    UI.user_error!("IOS_TARGET must be 'testflight' or 'app-store-review' (got '#{target}')") unless %w[testflight app-store-review].include?(target)
+    submit = target == "app-store-review"
+    bundle_id = ENV.fetch("IOS_BUNDLE_ID")
+    version = ENV.fetch("IOS_VERSION")
+    build_num = ENV.fetch("IOS_BUILD")
+
+    if env_bool("DRY_RUN")
+      UI.important("Dry run: IPA validated by the fetch step; App Store Connect is not contacted.")
+      next
+    end
+
+    api_key = asc_api_key
+    app = Spaceship::ConnectAPI::App.find(bundle_id)
+    UI.user_error!("No app with bundle ID #{bundle_id} in App Store Connect (or the API key cannot see it)") unless app
+
+    if existing_asc_upload(app, version, build_num)
+      UI.important("Build #{build_num} of version #{version} is already in App Store Connect. Not uploading it again.")
+      if submit || release_notes
+        # Waits until that build is processed (needed to submit it or set "What to Test") and sets
+        # "What to Test" when there are release notes. skip_submission: testers are not changed.
+        upload_to_testflight(
+          api_key: api_key,
+          distribute_only: true,
+          app_platform: "ios",
+          app_identifier: bundle_id,
+          app_version: version,
+          build_number: build_num,
+          changelog: release_notes,
+          skip_submission: true,
+          distribute_external: false,
+          uses_non_exempt_encryption: ios_uses_non_exempt_encryption,
+        )
+      end
+    else
+      upload_to_testflight(
+        api_key: api_key,
+        ipa: file,
+        changelog: release_notes,
+        # Build processing must finish before submitting or setting "What to Test".
+        skip_waiting_for_build_processing: !submit && release_notes.nil?,
+        distribute_external: false,
+        uses_non_exempt_encryption: ios_uses_non_exempt_encryption,
+      )
+    end
+
+    if submit
+      localized_notes = asc_whats_new(app, release_notes)
+
+      deliver(
+        api_key: api_key,
+        app_identifier: bundle_id,
+        app_version: version,
+        build_number: build_num,
+        skip_binary_upload: true,
+        skip_screenshots: true,
+        # Never skipped: deliver only applies automatic_release (manual release) when it updates the
+        # version's metadata. Without notes, the release type is the only thing it changes.
+        skip_metadata: false,
+        release_notes: localized_notes,
+        submit_for_review: true,
+        automatic_release: false,
+        force: true,
+        run_precheck_before_submit: false,
+        submission_information: { add_id_info_uses_idfa: false, export_compliance_uses_encryption: ios_uses_non_exempt_encryption },
+      )
+    end
+  end
+
+  desc "Check App Store Connect API credentials (read-only)"
+  lane :check_access do
+    asc_api_key # also authorizes Spaceship::ConnectAPI
+    app = Spaceship::ConnectAPI::App.find(ENV.fetch("IOS_BUNDLE_ID"))
+    UI.user_error!("App not found with bundle ID #{ENV.fetch('IOS_BUNDLE_ID')}") if app.nil?
+    UI.success("App Store Connect access OK for #{app.name} (#{app.bundle_id})")
+  end
+end

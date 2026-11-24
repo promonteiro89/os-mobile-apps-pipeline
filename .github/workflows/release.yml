@@ -1,0 +1,288 @@
+name: Release to stores
+
+run-name: "Release → ${{ inputs.platform }} (android:${{ inputs.android_track }} ios:${{ inputs.ios_target }})${{ inputs.dry_run && ' [dry run]' || '' }} by @${{ github.actor }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Platform
+        type: choice
+        default: both
+        options: [both, android, ios]
+      environment:
+        description: "LifeTime environment name to take the build from ('default' = the one in config/app.json)"
+        type: string
+        default: default
+      android_track:
+        description: Google Play track
+        type: choice
+        default: internal
+        options: [internal, alpha, beta, production]
+      android_rollout:
+        description: "Google Play rollout % (staged rollout when < 100)"
+        type: string
+        default: "100"
+      android_release_status:
+        description: "completed = release now, draft = finish in Play Console"
+        type: choice
+        default: completed
+        options: [completed, draft]
+      ios_target:
+        description: App Store Connect destination
+        type: choice
+        default: testflight
+        options: [testflight, app-store-review]
+      release_notes:
+        description: "What's new (optional, used for both stores)"
+        type: string
+        required: false
+      archive_release:
+        description: "Archive binary to GitHub Releases (permanent storage)"
+        type: boolean
+        default: true
+      dry_run:
+        description: Validate only, do not publish
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# One release at a time. Note: GitHub keeps only one *pending* run per group; a newer dispatch replaces a queued one.
+concurrency:
+  group: release-to-stores
+  cancel-in-progress: false
+
+env:
+  LIFETIME_HOST: ${{ vars.LIFETIME_HOST }}
+  # Install exactly the gems in Gemfile.lock (fastlane runs with the store keys loaded).
+  BUNDLE_FROZEN: "true"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      id: ${{ steps.plan.outputs.id }}
+      environment: ${{ steps.plan.outputs.environment }}
+      android: ${{ steps.plan.outputs.android }}
+      ios: ${{ steps.plan.outputs.ios }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - id: plan
+        env:
+          PLATFORM: ${{ inputs.platform }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          ROLLOUT: ${{ inputs.android_rollout }}
+        run: |
+          # The regex runs first, so awk only ever sees a plain decimal number.
+          if ! [[ "$ROLLOUT" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v r="$ROLLOUT" 'BEGIN { exit !(r > 0 && r <= 100) }'; then
+            echo "::error::android_rollout must be a number greater than 0 and at most 100 (got '$ROLLOUT')"; exit 1
+          fi
+          python scripts/lifetime.py plan --platform "$PLATFORM" --environment "$ENVIRONMENT"
+
+  android:
+    needs: plan
+    if: needs.plan.outputs.android == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.fetch.outputs.version }}
+      build: ${{ steps.fetch.outputs.build }}
+    # Approval gate: configure required reviewers on the store-production environment (see docs/SETUP.md).
+    environment: ${{ inputs.android_track == 'production' && !inputs.dry_run && 'store-production' || 'store-testing' }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Fetch binary from LifeTime
+        id: fetch
+        env:
+          LIFETIME_API_TOKEN: ${{ secrets.LIFETIME_API_TOKEN }}
+          ENVIRONMENT: ${{ needs.plan.outputs.environment }}
+        run: python scripts/lifetime.py fetch --platform android --environment "$ENVIRONMENT" --out build
+
+      # Workflow artifacts of a public repository can be downloaded by any signed-in GitHub user.
+      - name: Keep the verified binary as a workflow artifact (private repositories only)
+        if: ${{ github.event.repository.private }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ needs.plan.outputs.id }}-android
+          path: ${{ steps.fetch.outputs.file }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - uses: ruby/setup-ruby@de492cf36cbab201753d720ce4f4e336cd688c94 # v1.336.0
+        with:
+          ruby-version: "3.3"
+      # No shared gem cache in jobs that hold store keys: install from Gemfile.lock, checksums verified.
+      - run: bundle install --jobs 4
+
+      - name: Upload to Google Play
+        env:
+          GOOGLE_PLAY_JSON_KEY: ${{ secrets.GOOGLE_PLAY_JSON_KEY }}
+          RELEASE_FILE: ${{ steps.fetch.outputs.file }}
+          ANDROID_PACKAGE: ${{ steps.fetch.outputs.identifier }}
+          ANDROID_VERSION_CODE: ${{ steps.fetch.outputs.build }}
+          ANDROID_TRACK: ${{ inputs.android_track }}
+          ANDROID_ROLLOUT: ${{ inputs.android_rollout }}
+          ANDROID_RELEASE_STATUS: ${{ inputs.android_release_status }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+          RELEASE_NOTES_LANGUAGES: ${{ vars.RELEASE_NOTES_LANGUAGES || 'en-US' }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: bundle exec fastlane android upload
+
+      - name: Summary
+        if: success()
+        env:
+          TRACK: ${{ inputs.android_track }}
+          PACKAGE: ${{ steps.fetch.outputs.identifier }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          verb=$([ "$DRY_RUN" = "true" ] && echo "Validated (not published)" || echo "Uploaded")
+          echo "**$verb** \`$PACKAGE\` to Google Play track **$TRACK**." >> "$GITHUB_STEP_SUMMARY"
+
+  ios:
+    needs: plan
+    if: needs.plan.outputs.ios == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 90
+    outputs:
+      version: ${{ steps.fetch.outputs.version }}
+      build: ${{ steps.fetch.outputs.build }}
+    environment: ${{ inputs.ios_target == 'app-store-review' && !inputs.dry_run && 'store-production' || 'store-testing' }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Fetch binary from LifeTime
+        id: fetch
+        env:
+          LIFETIME_API_TOKEN: ${{ secrets.LIFETIME_API_TOKEN }}
+          ENVIRONMENT: ${{ needs.plan.outputs.environment }}
+        run: python scripts/lifetime.py fetch --platform ios --environment "$ENVIRONMENT" --out build
+
+      # Workflow artifacts of a public repository can be downloaded by any signed-in GitHub user.
+      - name: Keep the verified binary as a workflow artifact (private repositories only)
+        if: ${{ github.event.repository.private }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ needs.plan.outputs.id }}-ios
+          path: ${{ steps.fetch.outputs.file }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - uses: ruby/setup-ruby@de492cf36cbab201753d720ce4f4e336cd688c94 # v1.336.0
+        with:
+          ruby-version: "3.3"
+      # No shared gem cache in jobs that hold store keys: install from Gemfile.lock, checksums verified.
+      - run: bundle install --jobs 4
+
+      - name: Upload to App Store Connect
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          RELEASE_FILE: ${{ steps.fetch.outputs.file }}
+          IOS_TARGET: ${{ inputs.ios_target }}
+          IOS_BUNDLE_ID: ${{ steps.fetch.outputs.identifier }}
+          IOS_VERSION: ${{ steps.fetch.outputs.version }}
+          IOS_BUILD: ${{ steps.fetch.outputs.build }}
+          IOS_USES_NON_EXEMPT_ENCRYPTION: ${{ vars.IOS_USES_NON_EXEMPT_ENCRYPTION || 'false' }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+          RELEASE_NOTES_LANGUAGES: ${{ vars.RELEASE_NOTES_LANGUAGES || 'en-US' }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: bundle exec fastlane ios upload
+
+      - name: Summary
+        if: success()
+        env:
+          TARGET: ${{ inputs.ios_target }}
+          BUNDLE: ${{ steps.fetch.outputs.identifier }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          verb=$([ "$DRY_RUN" = "true" ] && echo "Validated (not published)" || echo "Uploaded")
+          echo "**$verb** \`$BUNDLE\` to App Store Connect (**$TARGET**)." >> "$GITHUB_STEP_SUMMARY"
+
+  archive:
+    name: Archive release
+    needs: [plan, android, ios]
+    # Runs when at least one platform reached its store; only the platforms that succeeded are archived.
+    if: always() && !inputs.dry_run && inputs.archive_release && (needs.android.result == 'success' || needs.ios.result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Deployment-branch rules on store-testing also limit which branches can create release tags.
+    environment: store-testing
+    permissions:
+      contents: write
+    steps:
+      - name: Refuse to archive in a public repository
+        if: ${{ !github.event.repository.private }}
+        run: |
+          echo "::error::This repository is public: archiving would publish the app binaries to everyone. Use a private repository, or run with archive_release unticked."
+          exit 1
+
+      - name: Download Android binary
+        if: needs.android.result == 'success'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ needs.plan.outputs.id }}-android
+          path: release-binaries
+
+      - name: Download iOS binary
+        if: needs.ios.result == 'success'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ needs.plan.outputs.id }}-ios
+          path: release-binaries
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          APP: ${{ needs.plan.outputs.id }}
+          NOTES: ${{ inputs.release_notes }}
+          ANDROID_OK: ${{ needs.android.result == 'success' }}
+          IOS_OK: ${{ needs.ios.result == 'success' }}
+          ANDROID_VERSION: ${{ needs.android.outputs.version }}
+          ANDROID_BUILD: ${{ needs.android.outputs.build }}
+          IOS_VERSION: ${{ needs.ios.outputs.version }}
+          IOS_BUILD: ${{ needs.ios.outputs.build }}
+        run: |
+          # Only use versions of platforms that actually reached their store.
+          if [ "$ANDROID_OK" != "true" ]; then ANDROID_VERSION=""; fi
+          if [ "$IOS_OK" != "true" ]; then IOS_VERSION=""; fi
+          VERSION="${ANDROID_VERSION:-$IOS_VERSION}"
+          VERSION="${VERSION:-unknown}"
+          TAG_NAME="${APP}-v${VERSION}-$(date -u +'%Y%m%d%H%M')"
+
+          {
+            printf "## Release %s v%s\n\nUploaded to stores on %s.\n\n" "$APP" "$VERSION" "$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            if [ "$ANDROID_OK" = "true" ]; then printf -- "- **Android version / build**: %s (%s)\n" "$ANDROID_VERSION" "$ANDROID_BUILD"; fi
+            if [ "$IOS_OK" = "true" ]; then printf -- "- **iOS version / build**: %s (%s)\n" "$IOS_VERSION" "$IOS_BUILD"; fi
+            if [ -n "$NOTES" ]; then printf "\n### What's New\n%s\n" "$NOTES"; fi
+            printf "\n### SHA-256\n\n\`\`\`\n"
+            (cd release-binaries && sha256sum -- *)
+            printf "\`\`\`\n"
+          } > release_body.md
+
+          echo "Creating GitHub Release $TAG_NAME..."
+          gh release create "$TAG_NAME" release-binaries/* \
+            --target "$GITHUB_SHA" \
+            --title "${APP} v${VERSION}" \
+            --notes-file release_body.md \
+            --latest=false

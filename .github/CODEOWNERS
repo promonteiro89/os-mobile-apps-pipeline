@@ -1,0 +1,10 @@
+# Code owners for the store release pipeline.
+# In your copy, uncomment and set your own user or team. Review by a code owner is only enforced
+# when a branch ruleset or branch protection requires it. See docs/SETUP.md.
+#
+# *              @your-org/release-owners
+# /.github/      @your-org/release-owners
+# /fastlane/     @your-org/release-owners
+# /scripts/      @your-org/release-owners
+# /config/       @your-org/release-owners
+# /Gemfile*      @your-org/release-owners

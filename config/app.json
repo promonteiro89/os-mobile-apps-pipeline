@@ -1,0 +1,10 @@
+{
+  "$comment": "The app this repository releases. Replace every value with your own (see docs/SETUP.md). lifetimeAppId is the LifeTime application key (a public identifier, not a credential). androidPackage / iosBundleId are pinned: the pipeline refuses to upload a binary whose identifier does not match (or cannot be read).",
+  "id": "my-app",
+  "name": "My App",
+  "lifetimeAppId": "00000000-0000-0000-0000-000000000000",
+  "androidPackage": "com.example.myapp",
+  "iosBundleId": "com.example.myapp",
+  "environment": "Production",
+  "platforms": ["android", "ios"]
+}
