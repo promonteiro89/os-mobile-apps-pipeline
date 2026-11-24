@@ -1,0 +1,23 @@
+.DS_Store
+build/
+__pycache__/
+fastlane/report.xml
+fastlane/README.md
+*.aab
+*.apk
+*.ipa
+*.p8
+*.json.key
+# Google Play service account keys, under the names the docs and Google Cloud use
+*-key.json
+key.json
+*.p12
+*.jks
+*.keystore
+
+# Local secrets and tooling
+.env
+.env.*
+*.mobileprovision
+.bundle/
+vendor/bundle/

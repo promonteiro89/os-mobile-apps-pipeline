@@ -1,0 +1,68 @@
+name: Bug report
+description: Something in the template doesn't work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Never paste secrets.** Redact tokens, keys (`.json`, `.p8`), Key / Issuer IDs, LifeTime hostnames, app names, package / bundle identifiers and anything else that identifies your organisation or app before posting logs.
+
+        **Security problem?** Don't open an issue: use the repository's **Security** tab → **Report a vulnerability** (see SECURITY.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: dropdown
+    id: workflow
+    attributes:
+      label: Workflow
+      options:
+        - Release to stores
+        - Check connections
+        - Validate
+        - Running a script locally
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: step
+    attributes:
+      label: Job and step
+      description: For example `ios` → *Upload to App Store Connect*.
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Android
+        - iOS
+        - Both
+        - Not platform-specific
+    validations:
+      required: true
+  - type: input
+    id: outsystems
+    attributes:
+      label: OutSystems 11 / LifeTime version
+      description: For example "OutSystems 11.x, LifeTime 11.x, OutSystems Cloud" or "self-managed".
+  - type: input
+    id: template-version
+    attributes:
+      label: Template version
+      description: The release tag or commit of this template your copy is based on.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (redacted)
+      description: The relevant log lines, with every secret and identifier removed.
+      render: text
+  - type: checkboxes
+    id: redacted
+    attributes:
+      label: Confirmation
+      options:
+        - label: I removed tokens, keys, hostnames and app identifiers from everything above.
+          required: true
